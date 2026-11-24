@@ -137,6 +137,7 @@ export interface RoutineRun {
   deliver?: RoutineDelivery;
   checkKey?: string;
   /** A posting script's output: the run's reply as written, posted with no AI turn; or why the script failed. */ post?: string | { error: string };
+  /** Its script answers it: it never starts an AI turn and never counts toward the checks' daily AI runs. */ scriptOnly?: true;
   createdAt: number;
   seenAt?: number;
 }
@@ -1150,9 +1151,7 @@ export class RoutineManager {
               continue;
             }
             await this.options.startGoal(run.groupId, task.threadId, prompt, run.botId, run.id, (message) => this.failThread(task.threadId, message, { cause: "refused" }));
-          } else if (run.post !== undefined) {
-            this.postRun(run, task.threadId);
-          } else {
+          } else if (run.scriptOnly) { this.postRun(run, task.threadId); } else {
             const execution = composeExecutionPrompt({ id: run.routineId, name: run.routineName, trigger: triggerSource, runOn: run.runOn ?? "maus", dryRun: run.dryRun }, prompt, run.attachments, continuityCarry(run, this.routines, this.runs), run.retried, routineMemory(run, this.routines, this.runs));
             await this.options.startTurn(run.botId, task.threadId, execution, run.runOn ?? "maus", triggerSource, (message) => this.failThread(task.threadId, message, { cause: "refused" }));
           }
@@ -1205,7 +1204,7 @@ export class RoutineManager {
             resultsThreadId: resolveRoutineResultsThread(current, this.options.resolveResultsThread, allocations, this.now(), run.sourceThreadId),
           });
           if (run.timeoutMinutes === undefined) delete run.timeoutMinutes;
-          Object.assign(run, { prompt: result.run.prompt, checkKey: result.run.key }, result.run.post === undefined ? {} : { post: result.run.post });
+          Object.assign(run, { prompt: result.run.prompt, checkKey: result.run.key }, result.run.post === undefined ? {} : { post: result.run.post, scriptOnly: true as const });
         } else if (queued && !result.trouble) {
           Object.assign(queued, { status: "completed", output: "Nothing new since the last check", report: { state: "quiet" }, finishedAt: this.now() } satisfies Partial<RoutineRun>);
         }
@@ -1271,10 +1270,11 @@ export class RoutineManager {
     return cloneRun(run);
   }
 
-  /** A run whose script wrote its reply: posted with no AI turn, and complete like a turn that said it. */
+  /** A run whose script wrote its reply: posted with no AI turn, and complete like a turn that said it. A failed script,
+   * or a text lost to a restart, fails it directly: never engine recovery, never a retry into a turn. */
   private postRun(run: RoutineRun, threadId: string): void {
-    const text = run.post!; delete run.post; if (typeof text !== "string") return this.failThread(threadId, text.error);
-    if (!this.options.postReply) return this.failThread(threadId, "This server cannot post a script's output as a reply", { cause: "refused" });
+    const text = run.post; delete run.post;
+    if (typeof text !== "string" || !this.options.postReply) { this.failRun(run, typeof text !== "string" ? text?.error ?? ROUTINE_RESTARTED : "This server cannot post a script's output as a reply"); return queueMicrotask(() => this.tickInBackground()); }
     Object.assign(run, { status: "completed", output: redactSecretsInText(text).trim().slice(0, 2_000), attention: undefined, error: undefined, finishedAt: this.now() } satisfies Partial<RoutineRun>);
     try { this.options.postReply(run.botId, threadId, text, cloneRun(run)); } catch (error) { return this.rejectResult(run.id, error instanceof Error ? error.message : String(error)); }
     this.ownerNotices = this.ownerNotices.filter((notice) => notice.botId !== run.botId); this.saveLater(); this.emitRun(run); queueMicrotask(() => this.tickInBackground());

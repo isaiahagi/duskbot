@@ -1,13 +1,13 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RoutineProbe } from "../shared/routines.ts";
-import { CHECK_BOOT_HOLD_MS, type RoutineCheckContext } from "./routine-check-pacing.ts";
+import { CHECK_BOOT_HOLD_MS, CHECK_RUNS_PER_DAY, checkRunsLeft, type RoutineCheckContext } from "./routine-check-pacing.ts";
 import { createRoutineProbes } from "./routine-probe.ts";
 import { scriptRunOptions, SCRIPT_TIMEOUT_MS, type ScriptResult } from "./routine-script.ts";
-import { RoutineManager, type Routine, type RoutineChecks, type RoutineManagerOptions } from "./routines.ts";
+import { ROUTINE_RESTARTED, RoutineManager, type Routine, type RoutineChecks, type RoutineManagerOptions, type RoutineRun } from "./routines.ts";
 
 const HOUR = 60 * 60_000;
 const START = new Date(2026, 10, 20, 9, 0, 0).getTime();
@@ -63,14 +63,15 @@ describe("a run with a post", () => {
     let now = START;
     const startTurn = vi.fn(async () => {});
     const contexts: RoutineCheckContext[] = [];
-    const checks: RoutineChecks = { check: async (_routine, context) => { contexts.push(context); return { run: { key: "probe:k", prompt: "p", post } }; }, release: () => {}, settled: () => {} };
+    const checks: RoutineChecks = { check: async (_routine, context) => { contexts.push(context); return { run: { key: "prb-k", prompt: "p", post } }; }, release: () => {}, settled: () => {} };
+    const file = join(tempDir(), "routines.json");
     const routines = new RoutineManager({
-      file: join(tempDir(), "routines.json"), now: () => now, botState: () => "ready",
+      file, now: () => now, botState: () => "ready",
       createTask: () => ({ threadId: "thread-1" }), startTurn, checks, ...options,
     });
     const routine = routines.create({ name: "Prices", prompt: "p", botId: "b", schedule: { type: "interval", everyMinutes: 60, anchorAt: START + HOUR }, probe: { kind: "script", url: "", command: "report" } });
     return {
-      routines, startTurn, contexts, routine,
+      routines, startTurn, contexts, routine, file, now: () => now,
       async hour() { now += CHECK_BOOT_HOLD_MS + HOUR; await routines.tick(); await settle(); },
     };
   }
@@ -84,13 +85,33 @@ describe("a run with a post", () => {
     expect(h.routines.listRuns()[0]).toMatchObject({ status: "completed", output: "Line one\n\nLine two" });
   });
 
-  it("fails with the script's error and posts nothing", async () => {
-    const postReply = vi.fn();
-    const h = manager({ postReply }, { error: "The script ran longer than 60 seconds." });
+  it.each(["curl: (28) Operation timed out", "401 Unauthorized"])("fails on the script's error %j as it is, never retried into a turn", async (error) => {
+    const postReply = vi.fn(), onRunFailed = vi.fn();
+    const h = manager({ postReply, onRunFailed }, { error });
+    await h.hour();
     await h.hour();
     expect(postReply).not.toHaveBeenCalled();
     expect(h.startTurn).not.toHaveBeenCalled();
-    expect(h.routines.listRuns()[0]).toMatchObject({ status: "failed", error: expect.stringMatching(/^The script ran longer than 60 seconds\./) });
+    expect(h.routines.listRuns()[0]).toMatchObject({ status: "failed", error });
+    expect(onRunFailed.mock.calls[0]?.[1]).toBeUndefined();
+  });
+
+  it("fails a run whose text a restart lost, with no AI turn", async () => {
+    const h = manager({ postReply: () => {} });
+    await h.hour();
+    h.routines.close();
+    const saved = JSON.parse(readFileSync(h.file, "utf8")) as { runs: RoutineRun[] };
+    Object.assign(saved.runs[0]!, { status: "running", output: undefined, finishedAt: undefined });
+    writeFileSync(h.file, JSON.stringify(saved));
+    let now = h.now();
+    const startTurn = vi.fn(async () => {});
+    const restarted = new RoutineManager({ file: h.file, now: () => now, botState: () => "ready", createTask: () => ({ threadId: "thread-2" }), startTurn, postReply: () => {} });
+    now += 60_000;
+    await restarted.tick();
+    await settle();
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(restarted.listRuns().find((run) => run.id === saved.runs[0]!.id)).toMatchObject({ status: "failed", error: ROUTINE_RESTARTED });
+    restarted.close();
   });
 
   it("tells the check a test run is one", async () => {
@@ -105,6 +126,14 @@ describe("a run with a post", () => {
     await h.hour();
     expect(h.startTurn).not.toHaveBeenCalled();
     expect(h.routines.listRuns()[0]).toMatchObject({ status: "failed", error: expect.stringMatching(/cannot post a script's output/) });
+  });
+});
+
+describe("the checks' daily AI runs", () => {
+  it("never counts a script-only run", () => {
+    const runs = (scriptOnly: boolean) => Array.from({ length: 30 }, (_, i) => ({ routineId: "r1", checkKey: `prb-${i}`, manual: false, createdAt: START - i * 30 * 60_000, ...(scriptOnly ? { scriptOnly: true } : {}) }) as RoutineRun);
+    expect(checkRunsLeft(runs(true), "r1", START)).toBe(CHECK_RUNS_PER_DAY);
+    expect(checkRunsLeft(runs(false), "r1", START)).toBe(0);
   });
 });
 
